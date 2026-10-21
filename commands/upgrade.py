@@ -521,7 +521,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         logger.info(f"Starting Project-wide AI Upgrade: from {from_ver} to {target_ver} ({target_db})")
 
         self._ensure_skills(
-            ["odoo_upgrade_utils", "custom_util", "odoo_upgrade_skill"],
+            ["odev", "odoo_upgrade_utils", "custom_util", "odoo_upgrade_skill", "odoo_commit_message_guidelines"],
             handler=agent.handler,
         )
 
