@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 import jinja2
 import networkx as nx
-from git import Repo
+from git import GitError, Repo
 
 from odev.common import args, progress
 from odev.common.commands import DatabaseCommand
@@ -27,6 +27,7 @@ from odev.common.odoobin import (
 )
 from odev.common.store.datastore import DataStore
 from odev.common.utils import EmployeeUtils
+from odev.common.version import OdooVersion
 
 from odev.plugins.odev_plugin_ai.common.mixins import AICommandMixin
 
@@ -36,6 +37,8 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+OPENUPGRADE_REPOSITORY = "OCA/OpenUpgrade"
 
 # Above this many lines in `ruff check --diff`, auto-linting would drown the git diff.
 NOISY_RUFF_DIFF_LINES = 50
@@ -320,7 +323,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         )
         modules_info = self._get_modules_info()
 
-        upgrade_instructions = self._setup_upgrade_instructions(upgrade_path, extra_bind_dirs)
+        upgrade_instructions = self._setup_upgrade_instructions(upgrade_path, from_ver, target_ver, extra_bind_dirs)
         from_odoo_path = (
             str(worktrees_path / from_ver) if (worktrees_path / from_ver).exists() else f"Virtual ({from_ver})"
         )
@@ -358,7 +361,9 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             modules_info,
         )
 
-    def _setup_upgrade_instructions(self, upgrade_path: Path, extra_bind_dirs: list[str]) -> str:
+    def _setup_upgrade_instructions(
+        self, upgrade_path: Path, from_ver: str, target_ver: str, extra_bind_dirs: list[str]
+    ) -> str:
         """Manage Odoo Upgrade repository and return instructions for AI, or nothing when it is unavailable."""
         upgrade_connector = GitConnector(ODOO_UPGRADE_REPOSITORY, path=upgrade_path)
         with progress.spinner(f"Managing {ODOO_UPGRADE_REPOSITORY!r} repository"):
@@ -373,8 +378,8 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
                 logger.warning(str(e))
 
         if not upgrade_connector.exists:
-            logger.warning(f"No repository found at {upgrade_path}. Proceeding without the migration scripts.")
-            return ""
+            logger.warning(f"No repository found at {upgrade_path}. Falling back to {OPENUPGRADE_REPOSITORY!r}.")
+            return self._setup_openupgrade_instructions(from_ver, target_ver, extra_bind_dirs)
 
         extra_bind_dirs.append(str(upgrade_path))
 
@@ -385,6 +390,55 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             "migrations for the modules you are upgrading. Use `grep` or `git grep` within this directory "
             "to find mentions of your module or specific fields/methods that have changed."
         )
+
+    def _setup_openupgrade_instructions(self, from_ver: str, target_ver: str, extra_bind_dirs: list[str]) -> str:
+        """Manage shallow OpenUpgrade checkouts of every version up to the target and return instructions for AI,
+        or nothing when none has migration scripts.
+        """
+        # Scripts migrating to X live on branch X: a jump over several versions needs each of them
+        versions = [
+            f"{major}.0" for major in range(OdooVersion(from_ver).major + 1, OdooVersion(target_ver).major + 1)
+        ] or [target_ver]
+        scripts = {version: path for version in versions if (path := self._checkout_openupgrade(version))}
+        if not scripts:
+            return ""
+
+        extra_bind_dirs.extend(str(path.parents[1]) for path in scripts.values())
+        scripts_list = ", ".join(f"`{path}` (to {version})" for version, path in scripts.items())
+
+        return (
+            f"\n- **Migration Scripts (OpenUpgrade)**: You have access to the OCA OpenUpgrade migration scripts, "
+            f"one directory per target version: {scripts_list}. They cover community modules only. For each "
+            "standard module your modules depend on, read `<directory>/<module>/<version>/upgrade_analysis_work.txt` "
+            "(or `upgrade_analysis.txt` when missing), where `<version>` is the module version such as `18.0.1.0`: "
+            "it lists the fields and models added, removed or changed in that version. The `pre-migration.py`, "
+            "`post-migration.py` and `end-migration.py` next to it show how the data is migrated. You MUST check "
+            "these files for every standard dependency and every version before editing, and use `grep` within "
+            "these directories to find specific fields/methods that have changed."
+        )
+
+    def _checkout_openupgrade(self, version: str) -> Path | None:
+        """Clone or update a shallow OpenUpgrade checkout of a version and return its scripts directory, if any."""
+        # One shallow clone per version: the full history weighs gigabytes and the AI only reads the latest scripts
+        url = f"https://github.com/{OPENUPGRADE_REPOSITORY}"
+        path = self.config.paths.repositories / "OCA" / f"OpenUpgrade-{version}"
+        with progress.spinner(f"Managing {OPENUPGRADE_REPOSITORY!r} repository on {version!r}"):
+            try:
+                if (path / ".git").is_dir():
+                    repo = Repo(path)
+                    repo.git.fetch("--depth=1", url, version)
+                    repo.git.reset("--hard", "FETCH_HEAD")
+                else:
+                    Repo.clone_from(url, path, branch=version, depth=1, single_branch=True)
+            except GitError as e:
+                # A stale checkout is still worth reading, the check below decides
+                logger.warning(f"Could not update {OPENUPGRADE_REPOSITORY!r} on {version!r}: {e}")
+
+        scripts_path = path / "openupgrade_scripts" / "scripts"
+        if not scripts_path.is_dir():
+            logger.warning(f"No {OPENUPGRADE_REPOSITORY!r} migration scripts for {version}. Proceeding without them.")
+            return None
+        return scripts_path
 
     def _setup_knowledge_index_context(
         self,
